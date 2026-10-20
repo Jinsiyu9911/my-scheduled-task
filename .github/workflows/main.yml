@@ -2,16 +2,22 @@ name: 电表监控长循环
 
 # ── 触发方式 ───────────────────────────────────────────────────────────────
 # 1) schedule：每天 00:00 UTC 兜底触发一次，万一接力链断了也能自己爬起来；
-# 2) workflow_dispatch：手动触发，并用于上一轮 job 结束后的「接力」。
+# 2) workflow_dispatch：手动触发 + 上一轮 job 结束后的「接力」。
 #    注意：本 workflow 自己 dispatch 自己不会触发——GitHub 规定
 #          「由 GITHUB_TOKEN 产生的 workflow_run/dispatch，不会再运行新的 workflow」，
 #    所以接力必须用一个 PAT（secrets.PAT_TOKEN）。
+#    手动跑时可以填 max_run（秒）做短跑验证，比如 180 秒就能看到完整链路。
 on:
   schedule:
     - cron: '0 0 * * *'
   workflow_dispatch:
+    inputs:
+      max_run:
+        description: '本次运行秒数（测试用，留空=20700 即 5h45m）'
+        required: false
+        default: ''
 
-# 提交 data/ 需要写权限；这里同时充当 GITHUB_TOKEN 的权限上限
+# 提交 data/ 需要写权限；actions: write 用于接力 dispatch
 permissions:
   contents: write
   actions: write
@@ -19,6 +25,11 @@ permissions:
 concurrency:
   group: meter-monitor-long-loop
   cancel-in-progress: false
+
+env:
+  # runner 默认 UTC。设成北京时间，CSV 时间戳、每日 22:00 汇总、图表坐标轴才符合预期。
+  TZ: Asia/Shanghai
+  DATA_DIR: .github/workflows/data
 
 jobs:
   run-loop:
@@ -28,51 +39,72 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Checkout（保留 data/ 历史，避免重复 commit 冲突）
+      - name: Checkout（保留完整历史，便于 rebase 推送）
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: true      # main.py 内部的自动提交要用这份凭证推送
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Run main.py
-        # -u：强制实时输出，方便在网页上随时看进度
-        # main.py 与 monitor.py 都在本 workflow 文件同目录（.github/workflows/）；
-        # main.py 会按自身所在目录定位 monitor.py 与 data/，与仓库根目录无关。
-        # main.py 在退出前会写 data/.ready_to_commit 并停 3 秒，给下面的提交步骤留缓冲
-        run: python -u .github/workflows/main.py
+      - name: 准备 data 目录
+        # 全新克隆里没有 data/，先建出来，避免 git add 报 pathspec 错
+        run: mkdir -p "$DATA_DIR"
 
-      - name: Commit data（有变化才提交）
-        # 只有正常结束（主动 exit(0)）才提交，避免把中途失败的数据当成可继承状态
-        # 数据目录 = main.py 所在目录（.github/workflows/）下的 data/
+      - name: Run main.py
+        # -u：强制实时输出，方便在网页上随时看进度。
+        # main.py 每 30 分钟会把 data/ 里的小文件（CSV/JSON）提交并推回仓库，
+        # 所以跑起来后半小时内就能在仓库里看到文件，不用等 5h45m 结束。
+        # 图表（BMP 较大）不频繁提交，改为随 artifact 一起打包（见后面的步骤）。
+        env:
+          MAX_RUN: ${{ github.event.inputs.max_run }}
+        run: |
+          ARGS=""
+          if [ -n "${MAX_RUN}" ]; then ARGS="--max-run ${MAX_RUN}"; fi
+          echo "启动参数: ${ARGS:-（默认 5h45m）}"
+          python -u .github/workflows/main.py ${ARGS}
+
+      - name: Commit data（兜底提交，有变化才提交）
+        # main.py 已定期提交过小文件；这里补上它没管的（以及停跑瞬间的最后状态），
+        # 同时确保本次运行一定落盘一次。charts/ 与日志不提交（体积大），走 artifact。
         if: success()
         run: |
           set -e
-          DATA_DIR=".github/workflows/data"
           git config user.name  "meter-monitor-bot"
           git config user.email "meter-monitor-bot@users.noreply.github.com"
 
-          # 只提交运行产物；main.py / monitor.py / workflow 本身的改动请手工提交
-          git add -A "$DATA_DIR"
+          # BMP 不提交（每张约 938KB），PNG 由 main.py 转换后才提交（约 6KB）
+          git add -A -- "$DATA_DIR" ':(exclude)'"$DATA_DIR/charts/*.bmp" ':(exclude)'"$DATA_DIR/monitor.log" ':(exclude)'"$DATA_DIR/alerts.log"
           if git diff --cached --quiet; then
             echo "data/ 无变化，跳过提交"
-            exit 0
+          else
+            git commit -m "data: $(date '+%Y-%m-%d %H:%M %Z') 电表数据"
+            for i in 1 2 3; do
+              git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && \
+              git push origin "HEAD:${GITHUB_REF_NAME}" && break
+              echo "push 第 $i 次失败，2 秒后重试"; sleep 2
+            done
           fi
 
-          git commit -m "data: $(date -u '+%Y-%m-%d %H:%M UTC') 电表数据（$(ls "$DATA_DIR/charts" 2>/dev/null | wc -l) 个图表）"
-          # 接力期间可能有别的运行刚推过，先 rebase 再推，冲突就重试
-          for i in 1 2 3; do
-            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && \
-            git push origin "HEAD:${GITHUB_REF_NAME}" && break
-            echo "push 第 $i 次失败，2 秒后重试"; sleep 2
-          done
+      - name: Upload charts（本次运行的图表与日志）
+        # 图表每张约 1MB，提交进 git 会让历史迅速膨胀，所以打包成 artifact 供下载；
+        # 保留 14 天，与 monitor.py 的 RETENTION_DAYS 对齐。
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meter-charts-${{ github.run_number }}
+          path: |
+            .github/workflows/data/charts/*.bmp
+            .github/workflows/data/monitor.log
+            .github/workflows/data/alerts.log
+          retention-days: 14
+          if-no-files-found: ignore
 
       - name: Trigger Next Workflow (Restart)
-        # 关键：只有前面步骤都成功（Python 主动 exit(0)）才接力，保持你的原语义
+        # 关键：只有前面步骤都成功（Python 主动 exit(0)）才接力，保持原语义
         if: success()
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
@@ -89,12 +121,19 @@ jobs:
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/main.yml/dispatches" \
             -d "{\"ref\":\"${GITHUB_REF_NAME}\"}"
 
-      - name: Summary
+      - name: Summary（数据与文件直达链接）
         if: always()
         run: |
-          DATA_DIR=".github/workflows/data"
+          BASE="https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/${DATA_DIR}"
+          TREE="https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_REF_NAME}/${DATA_DIR}"
           {
             echo "### 电表监控本轮摘要"
+            echo ""
+            echo "- 当前时间：$(date '+%Y-%m-%d %H:%M:%S %Z')"
+            if [ -f "$DATA_DIR/meter_data.csv" ]; then
+              echo "- CSV 行数：$(($(wc -l < "$DATA_DIR/meter_data.csv") - 1))"
+            fi
+            echo "- 图表数：$(ls "$DATA_DIR/charts" 2>/dev/null | wc -l)（本轮的已打包到下方 Artifacts）"
             echo ""
             if [ -f "$DATA_DIR/latest.json" ]; then
               echo '```json'
@@ -102,7 +141,12 @@ jobs:
               echo '```'
             fi
             echo ""
-            echo "- CSV 行数：$(($(wc -l < "$DATA_DIR/meter_data.csv" 2>/dev/null || echo 1) - 1))"
-            echo "- 图表数：$(ls "$DATA_DIR/charts" 2>/dev/null | wc -l)"
-            echo "- 告警兜底日志：$(test -f "$DATA_DIR/alerts.log" && echo 有 || echo 无)"
+            echo "**文件直达**（页面刷新即可看到最新提交）"
+            echo ""
+            echo "- [meter_data.csv](${BASE}/meter_data.csv)"
+            echo "- [latest.json](${BASE}/latest.json)"
+            echo "- [alert_state.json](${BASE}/alert_state.json)"
+            echo "- [数据目录](${TREE})"
+            echo ""
+            echo "> 图表与日志体积较大，未提交到仓库；在本次运行的 **Artifacts → meter-charts-* ** 里下载（保留 14 天）。"
           } >> "$GITHUB_STEP_SUMMARY"

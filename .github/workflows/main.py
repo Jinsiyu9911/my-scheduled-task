@@ -38,6 +38,7 @@
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.request
@@ -49,6 +50,18 @@ SLEEP_SECONDS = 60              # 每轮间隔：与 monitor.py 的「每分钟�
 WAIT_ALIGNED = True             # 是否对齐到整分再跑（monitor.py 的实时图表靠 minute == 0 触发）
 PROGRESS_EVERY = 30             # 每 N 轮打一次进度（避免 6 小时刷出 300 多行一样的日志）
 WEBHOOK_URL = ""                # 可选：企业微信/钉钉/飞书机器人的 webhook 地址（留空=不发）
+
+# 边跑边提交：每 30 分钟把 data/ 里的小文件提交并推回仓库，0 表示关闭。
+# 只提交 CSV/JSON 这类小文件（几 KB/次）；charts/*.bmp 每张近 1MB，
+# 所以图表先转成 PNG 再提交（见 PUBLISH_CHARTS），BMP 本身只留在 artifact 里。
+AUTO_COMMIT_EVERY = 1800
+COMMIT_FILES = ("meter_data.csv", "latest.json", "alert_state.json",
+                ".last_prune", ".ready_to_commit")
+
+# 图表发布：monitor.py 只会写 BMP（每张约 938KB），直接提交进 git 一个月能涨几百 MB。
+# 这里用标准库 zlib 把它转成同名 PNG（实测 3~7KB）再提交，成本降到 1/150，
+# 于是「整点生成图表」也能在 1 分钟内出现在仓库里。
+PUBLISH_CHARTS = True
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -101,6 +114,185 @@ def fetch_webhook_proxy(url):
     except Exception as e:
         print(f"[webhook] 推送失败: {type(e).__name__}: {e}")
         return False
+
+
+# ====================== 图表转 PNG（纯标准库） ======================
+def _bmp_to_png(bmp_path, png_path):
+    """把 monitor.py 生成的未压缩 24 位 BMP 转成 PNG。
+
+    不引入 Pillow：PNG 的结构简单到用 zlib + struct 就够——IHDR/IDAT/IEND 三个块，
+    每行前加一个 filter 字节 0，像素从 BMP 的 BGR 换序成 PNG 的 RGB。
+    实测 800x400 的图表：空图 3.4KB、24 根柱子的满图 6.4KB，约 BMP 的 1/150。
+    """
+    import struct
+    import zlib
+
+    with open(bmp_path, "rb") as f:
+        data = f.read()
+    if data[:2] != b"BM":
+        raise ValueError("不是 BMP 文件")
+    off = struct.unpack_from("<I", data, 10)[0]
+    w, h = struct.unpack_from("<ii", data, 18)
+    bpp = struct.unpack_from("<H", data, 28)[0]
+    compression = struct.unpack_from("<I", data, 30)[0]
+    if bpp != 24 or compression != 0 or h <= 0 or w <= 0:
+        raise ValueError(f"只支持未压缩 24 位下→上 BMP (bpp={bpp}, comp={compression}, h={h})")
+
+    stride = (w * 3 + 3) // 4 * 4
+    raw = bytearray()
+    for y in range(h):
+        start = off + (h - 1 - y) * stride        # BMP 像素是从下往上存的
+        line = data[start:start + w * 3]
+        inter = bytearray(w * 3)
+        inter[0::3] = line[2::3]                  # BGR -> RGB，用切片让 C 层做搬砖
+        inter[1::3] = line[1::3]
+        inter[2::3] = line[0::3]
+        raw.append(0)                             # PNG 每行前缀：filter type 0 (None)
+        raw.extend(inter)
+
+    def chunk(tag, payload):
+        return (struct.pack(">I", len(payload)) + tag + payload +
+                struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF))
+
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)   # 8bit / truecolor RGB
+    png = (b"\x89PNG\r\n\x1a\n" +
+           chunk(b"IHDR", ihdr) +
+           chunk(b"IDAT", zlib.compress(bytes(raw), 9)) +
+           chunk(b"IEND", b""))
+    with open(png_path, "wb") as f:
+        f.write(png)
+
+
+def publish_charts(verbose=True):
+    """把 charts/ 下新生成的 BMP 转成 PNG（PNG 才会被提交进仓库）。返回转换个数。"""
+    if not PUBLISH_CHARTS:
+        return 0
+    chart_dir = os.path.join(PROJECT_DIR, "data", "charts")
+    if not os.path.isdir(chart_dir):
+        return 0
+    converted = 0
+    for name in sorted(os.listdir(chart_dir)):
+        if not name.lower().endswith(".bmp"):
+            continue
+        bmp = os.path.join(chart_dir, name)
+        png = bmp[:-4] + ".png"
+        try:
+            if os.path.exists(png) and os.path.getmtime(png) >= os.path.getmtime(bmp):
+                continue
+            _bmp_to_png(bmp, png)
+            converted += 1
+            if verbose:
+                print(f"[chart] BMP -> PNG: {os.path.basename(png)} "
+                      f"({os.path.getsize(png) // 1024}KB)")
+        except Exception as e:
+            print(f"[chart] 转换失败 {name}: {type(e).__name__}: {e}")
+    return converted
+
+
+# ====================== 数据提交（边跑边推） ======================
+REPO_ROOT_CACHE = []            # 缓存 git 仓库根目录；空列表=还没查过，[None]=不是 git 仓库
+
+
+def _git(args, cwd):
+    try:
+        p = subprocess.run(["git"] + args, cwd=cwd, capture_output=True,
+                           text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        return -1, "", f"{type(e).__name__}: {e}"
+    return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+
+
+def repo_root():
+    """返回 git 仓库根目录；不在仓库里（比如本地直接跑）返回 None。"""
+    if REPO_ROOT_CACHE:
+        return REPO_ROOT_CACHE[0]
+    code, out, _ = _git(["rev-parse", "--show-toplevel"], PROJECT_DIR)
+    root = out if code == 0 and out else None
+    if root:
+        root = os.path.abspath(root)
+    REPO_ROOT_CACHE.append(root)
+    return root
+
+
+def commit_data(verbose=True):
+    """把 data/ 里的小文件提交并推回当前分支。返回 True 表示真的提交了。
+
+    设计取舍：
+      - 只提交 COMMIT_FILES（CSV/JSON，每次增量几 KB）与 charts/*.png，
+        不提交 charts/*.bmp（每张约 938KB）与 monitor.log，否则 git 历史会迅速膨胀；
+      - 推送失败（没 PAT、网络抖动）只记日志，绝不打断主循环；
+      - 不在 git 仓库里（本地开发）直接跳过。
+    """
+    root = repo_root()
+    if not root:
+        if verbose:
+            print("[commit] 跳过：当前目录不在 git 仓库内")
+        return False
+
+    data_rel = os.path.relpath(os.path.join(PROJECT_DIR, "data"), root).replace("\\", "/")
+    data_abs = os.path.join(PROJECT_DIR, "data")
+    targets = [f"{data_rel}/{name}" for name in COMMIT_FILES
+               if os.path.exists(os.path.join(data_abs, name))]
+    # 图表只提交转换后的 PNG（体积约 BMP 的 1/50）
+    chart_dir = os.path.join(data_abs, "charts")
+    if os.path.isdir(chart_dir):
+        targets += [f"{data_rel}/charts/{name}" for name in sorted(os.listdir(chart_dir))
+                    if name.lower().endswith(".png")]
+    if not targets:
+        if verbose:
+            print("[commit] 跳过：data/ 里没有可提交的文件")
+        return False
+
+    code, _, err = _git(["add", "-A", "--"] + targets, root)
+    if code != 0:
+        print(f"[commit] git add 失败: {err}")
+        return False
+
+    # Actions 上默认没有 git 身份，缺失时补一个（已配置过就不动用户自己的设置）
+    if _git(["config", "user.name"], root)[0] != 0:
+        _git(["config", "user.name", "meter-monitor-bot"], root)
+    if _git(["config", "user.email"], root)[0] != 0:
+        _git(["config", "user.email", "meter-monitor-bot@users.noreply.github.com"], root)
+
+    code, _, _ = _git(["diff", "--cached", "--quiet"], root)
+    if code == 0:                 # 没有变化
+        if verbose:
+            print("[commit] 跳过：data/ 无变化")
+        return False
+
+    msg = f"data: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 电表数据（自动提交）"
+    code, _, err = _git(["commit", "-q", "-m", msg], root)
+    if code != 0:
+        print(f"[commit] git commit 失败: {err}")
+        return False
+
+    _, sha, _ = _git(["rev-parse", "--short", "HEAD"], root)
+    print(f"[commit] 已提交 {sha}: {msg}")
+
+    # 推送：接力期间可能有别的运行刚推过，先 rebase 再推，重试 3 次
+    branch = os.environ.get("GITHUB_REF_NAME") or ""
+    for attempt in range(1, 4):
+        if branch:
+            _git(["pull", "--rebase", "--autostash", "origin", branch], root)
+        code, _, err = _git(["push", "origin", f"HEAD:{branch}" if branch else "HEAD"], root)
+        if code == 0:
+            print(f"[commit] 已推送 (第 {attempt} 次尝试)")
+            return True
+        print(f"[commit] 推送失败（第 {attempt} 次）: {err[:200]}")
+        time.sleep(2)
+
+    print("[commit] 推送多次失败，数据先留在 runner 上；本轮继续跑")
+    return True
+
+
+def _maybe_commit(last_commit_ts):
+    """到点就提交一次，返回新的时间戳。"""
+    if AUTO_COMMIT_EVERY <= 0:
+        return last_commit_ts
+    if time.time() - last_commit_ts < AUTO_COMMIT_EVERY:
+        return last_commit_ts
+    commit_data(verbose=False)
+    return time.time()
 
 
 # ====================== 单轮执行 ======================
@@ -163,7 +355,7 @@ def _mark_ready_for_commit(delay=3.0):
 
 # ====================== 主循环 ======================
 def main(argv=None):
-    global MAX_RUN_TIME, SLEEP_SECONDS, WAIT_ALIGNED
+    global MAX_RUN_TIME, SLEEP_SECONDS, WAIT_ALIGNED, AUTO_COMMIT_EVERY
 
     p = argparse.ArgumentParser(description="电表监控定时任务入口（长跑 + 主动接力退出）")
     p.add_argument("--max-run", type=int, default=MAX_RUN_TIME,
@@ -176,11 +368,14 @@ def main(argv=None):
     p.add_argument("--no-align", action="store_true", help="不等待对齐整分，逐轮立即跑")
     p.add_argument("--webhook", default=WEBHOOK_URL,
                    help="可选：告警栏 robot webhook 地址（企业微信/钉钉/飞书）")
+    p.add_argument("--commit-every", type=int, default=AUTO_COMMIT_EVERY,
+                   help=f"每 N 秒把 data/ 小文件提交并推回仓库，默认 {AUTO_COMMIT_EVERY}；0=关闭")
     args = p.parse_args(argv)
 
     MAX_RUN_TIME = args.max_run
     SLEEP_SECONDS = max(1, args.interval)
     WAIT_ALIGNED = not args.no_align
+    AUTO_COMMIT_EVERY = max(0, args.commit_every)
 
     setup_console()
     start_time = time.time()
@@ -191,10 +386,13 @@ def main(argv=None):
     print(f"  最长运行     = {MAX_RUN_TIME}s ({MAX_RUN_TIME / 3600:.2f}h，平台 6h 上限前主动退出)")
     print(f"  轮间隔       = {SLEEP_SECONDS}s，对齐整分 = {WAIT_ALIGNED}")
     print(f"  子进程模式   = {not args.inline}")
+    print(f"  自动提交     = {'关闭' if AUTO_COMMIT_EVERY <= 0 else f'每 {AUTO_COMMIT_EVERY}s'} "
+          f"(git 仓库: {repo_root() or '不在仓库内，跳过'})")
     print(f"  启动时间     = {started_at}")
 
     count = 0
     failures = 0
+    last_commit = time.time()
     while True:
         count += 1
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -229,7 +427,16 @@ def main(argv=None):
         if args.once:
             print("[main] --once：单轮模式，退出")
             _mark_ready_for_commit(delay=0)
+            publish_charts()
+            commit_data()
             return code
+
+        # 图表整点生成后，立刻转成 PNG 备提交（只有整点那一轮会真的转换）
+        publish_charts(verbose=False)
+
+        # 边跑边提交：到点就把 data/ 里的小文件推回仓库，
+        # 这样网页上随时能看到 CSV，也不用怕 6 小时中途被取消导致数据全丢
+        last_commit = _maybe_commit(last_commit)
 
         # 进度心跳：每 PROGRESS_EVERY 轮报一次运行时长，方便在 Actions 日志里定位
         if count % PROGRESS_EVERY == 0:
@@ -243,8 +450,10 @@ def main(argv=None):
             print(f"已运行 {elapsed_time:.0f} 秒，即将达到平台限制。")
             print(f"统计：共 {count} 轮，失败 {failures} 轮")
             print("主动保存状态，正常退出，准备触发下一轮接力...")
-            # 给 workflow 留出提交 data/ 的时间：先写 READY 标记，再停 3 秒
-            _mark_ready_for_commit()
+            # 退出前再提交一次，把最后这段时间的数据也推上去
+            _mark_ready_for_commit(delay=0)
+            publish_charts(verbose=False)
+            commit_data(verbose=False)
             # exit(0) 表示正常结束，平台会判定这一步为 success
             sys.exit(0)
 
