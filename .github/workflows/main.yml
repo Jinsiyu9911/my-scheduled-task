@@ -1,49 +1,108 @@
-name: Long Loop Auto Restart
+name: 电表监控长循环
 
+# ── 触发方式 ───────────────────────────────────────────────────────────────
+# 1) schedule：每天 00:00 UTC 兜底触发一次，万一接力链断了也能自己爬起来；
+# 2) workflow_dispatch：手动触发，并用于上一轮 job 结束后的「接力」。
+#    注意：本 workflow 自己 dispatch 自己不会触发——GitHub 规定
+#          「由 GITHUB_TOKEN 产生的 workflow_run/dispatch，不会再运行新的 workflow」，
+#    所以接力必须用一个 PAT（secrets.PAT_TOKEN）。
 on:
   schedule:
-    # 兜底机制：每天触发一次，防止某次网络问题导致接力失败彻底断掉
-    - cron: '0 0 * * *' 
+    - cron: '0 0 * * *'
   workflow_dispatch:
 
+# 提交 data/ 需要写权限；这里同时充当 GITHUB_TOKEN 的权限上限
 permissions:
+  contents: write
   actions: write
 
 concurrency:
-  group: long-loop-task
+  group: meter-monitor-long-loop
   cancel-in-progress: false
 
 jobs:
   run-loop:
     runs-on: ubuntu-latest
-    # 这里设置 360 分钟（6小时）。因为 Python 会在 5小时45分主动退出，
-    # 这个 timeout 只是用来防止 Python 代码卡死时，被平台强制杀掉。
-    timeout-minutes: 350 
-    
+    # 平台单 job 硬上限 6 小时。main.py 会在 5h45m 主动 exit(0) 交棒，
+    # 这里的 timeout 只是防止 Python 卡死时被平台强杀。
+    timeout-minutes: 350
+
     steps:
-      - name: Checkout repository
+      - name: Checkout（保留 data/ 历史，避免重复 commit 冲突）
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
       - name: Run main.py
-        # -u 参数强制实时输出日志，方便你在网页上随时查看进度
+        # -u：强制实时输出，方便在网页上随时看进度
+        # main.py 与 monitor.py 都在本 workflow 文件同目录（.github/workflows/）；
+        # main.py 会按自身所在目录定位 monitor.py 与 data/，与仓库根目录无关。
+        # main.py 在退出前会写 data/.ready_to_commit 并停 3 秒，给下面的提交步骤留缓冲
         run: python -u .github/workflows/main.py
 
+      - name: Commit data（有变化才提交）
+        # 只有正常结束（主动 exit(0)）才提交，避免把中途失败的数据当成可继承状态
+        # 数据目录 = main.py 所在目录（.github/workflows/）下的 data/
+        if: success()
+        run: |
+          set -e
+          DATA_DIR=".github/workflows/data"
+          git config user.name  "meter-monitor-bot"
+          git config user.email "meter-monitor-bot@users.noreply.github.com"
+
+          # 只提交运行产物；main.py / monitor.py / workflow 本身的改动请手工提交
+          git add -A "$DATA_DIR"
+          if git diff --cached --quiet; then
+            echo "data/ 无变化，跳过提交"
+            exit 0
+          fi
+
+          git commit -m "data: $(date -u '+%Y-%m-%d %H:%M UTC') 电表数据（$(ls "$DATA_DIR/charts" 2>/dev/null | wc -l) 个图表）"
+          # 接力期间可能有别的运行刚推过，先 rebase 再推，冲突就重试
+          for i in 1 2 3; do
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && \
+            git push origin "HEAD:${GITHUB_REF_NAME}" && break
+            echo "push 第 $i 次失败，2 秒后重试"; sleep 2
+          done
+
       - name: Trigger Next Workflow (Restart)
-        # 关键修改：只有前面正常结束（主动 exit(0)），才执行接力
-        if: success() 
+        # 关键：只有前面步骤都成功（Python 主动 exit(0)）才接力，保持你的原语义
+        if: success()
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
+          if [ -z "${PAT_TOKEN}" ]; then
+            echo "::error::缺少 secrets.PAT_TOKEN，接力失败（PAT 需要 actions:write + contents:write）"
+            exit 1
+          fi
           echo "上一轮任务已圆满结束，正在触发下一轮..."
-          curl -L \
-            -X POST \
+          curl -fsSL -X POST \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.PAT_TOKEN }}" \
+            -H "Authorization: Bearer ${PAT_TOKEN}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/main.yml/dispatches \
-            -d '{"ref":"main"}'
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/main.yml/dispatches" \
+            -d "{\"ref\":\"${GITHUB_REF_NAME}\"}"
+
+      - name: Summary
+        if: always()
+        run: |
+          DATA_DIR=".github/workflows/data"
+          {
+            echo "### 电表监控本轮摘要"
+            echo ""
+            if [ -f "$DATA_DIR/latest.json" ]; then
+              echo '```json'
+              cat "$DATA_DIR/latest.json"
+              echo '```'
+            fi
+            echo ""
+            echo "- CSV 行数：$(($(wc -l < "$DATA_DIR/meter_data.csv" 2>/dev/null || echo 1) - 1))"
+            echo "- 图表数：$(ls "$DATA_DIR/charts" 2>/dev/null | wc -l)"
+            echo "- 告警兜底日志：$(test -f "$DATA_DIR/alerts.log" && echo 有 || echo 无)"
+          } >> "$GITHUB_STEP_SUMMARY"

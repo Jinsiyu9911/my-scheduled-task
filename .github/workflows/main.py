@@ -9,6 +9,14 @@
     - monitor.py 保持独立可运行（python monitor.py / --loop / --chart ...），
                  自身不感知平台；这里只是把它当成一个模块来调用。
 
+文件布局（注意：三个文件都放在 .github/workflows/ 下）：
+    .github/workflows/main.py      ← 本文件，定时任务入口
+    .github/workflows/monitor.py   ← 业务代码，独立可运行
+    .github/workflows/main.yml     ← workflow 定义
+    因此 main.py 里用「脚本自身所在目录」定位 monitor.py，
+    而 monitor.py 的 PROJECT_DIR 也等于这个目录 → data/ 会落在 .github/workflows/data/。
+    workflow 里必须相应提交 .github/workflows/data，否则 runner 上的数据会随虚拟机一起消失。
+
 每轮流程：
     import monitor → monitor.setup_console()（UTF-8）→ monitor.setup_log()（写 data/monitor.log）
     → monitor.run_once()（抓取 → CSV → 告警 → 整点出图）
@@ -19,9 +27,12 @@
     - 单 job 最长 6 小时会被强杀，这里留 15 分钟余量主动 exit(0) 收尾；
     - Actions 的 runner 是 Ubuntu/Windows 虚拟机，无交互桌面：
       monitor.notify() 会失败，告警正文会落到 data/alerts.log（已有兜底逻辑）；
-      真要在 Actions 里推送通知，把 --notify-webhook 指向企业微信/钉钉/飞书机器人即可。
+      真要在 Actions 里推送通知，把 --webhook 指向企业微信/钉钉/飞书机器人即可。
     - data/ 里的 CSV、图表、alert_state.json 必须靠 workflow 里的 commit 或 artifacts 保住，
-      否则 14 天保留期也只剩一次运行的记忆。
+      否则 14 天保留期也只剩一次运行的记忆。workflow 通过「进程结束时扫 data/ 有无变化」
+      决定要不要提交：有变化才 commit（避免 6 小时窗口里狂推 300 次），
+      并在退出后延时几秒再 commit，让 runner 上的 git 写完、日志落地。
+      数据目录是「与 main.py 同目录」的 data/，即 .github/workflows/data/。
 """
 
 import argparse
@@ -126,6 +137,30 @@ def run_once_inline():
         pass
 
 
+# ====================== 接力退出标记 ======================
+READY_MARKER = os.path.join(PROJECT_DIR, "data", ".ready_to_commit")
+
+
+def _mark_ready_for_commit(delay=3.0):
+    """写一个 READY 标记后停几秒。
+
+    workflow 在「本步骤跑完」之后才做 git 提交（见 main.yml），这里先刷盘 + 留出缓冲，
+    顺便把标记文件也放进 data/，让 data/ 目录永远非空，避免 git 提交步骤出错。
+    """
+    try:
+        os.makedirs(os.path.dirname(READY_MARKER), exist_ok=True)
+        with open(READY_MARKER, "w", encoding="utf-8") as f:
+            f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    except OSError as e:
+        print(f"[main] 写 READY 标记失败: {e}")
+    for stream_ in (sys.stdout, sys.stderr):
+        try:
+            stream_.flush()
+        except Exception:
+            pass
+    time.sleep(delay)
+
+
 # ====================== 主循环 ======================
 def main(argv=None):
     global MAX_RUN_TIME, SLEEP_SECONDS, WAIT_ALIGNED
@@ -193,6 +228,7 @@ def main(argv=None):
 
         if args.once:
             print("[main] --once：单轮模式，退出")
+            _mark_ready_for_commit(delay=0)
             return code
 
         # 进度心跳：每 PROGRESS_EVERY 轮报一次运行时长，方便在 Actions 日志里定位
@@ -207,6 +243,8 @@ def main(argv=None):
             print(f"已运行 {elapsed_time:.0f} 秒，即将达到平台限制。")
             print(f"统计：共 {count} 轮，失败 {failures} 轮")
             print("主动保存状态，正常退出，准备触发下一轮接力...")
+            # 给 workflow 留出提交 data/ 的时间：先写 READY 标记，再停 3 秒
+            _mark_ready_for_commit()
             # exit(0) 表示正常结束，平台会判定这一步为 success
             sys.exit(0)
 
