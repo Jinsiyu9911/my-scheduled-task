@@ -1,24 +1,24 @@
-name: Infinite Loop Auto Restart
+name: Long Loop Auto Restart
 
 on:
   schedule:
-    # 兜底：每天 UTC 0点 触发一次
+    # 兜底机制：每天触发一次，防止某次网络问题导致接力失败彻底断掉
     - cron: '0 0 * * *' 
   workflow_dispatch:
 
 permissions:
   actions: write
 
-# 并发控制：确保同一时间只有一个该工作流在运行
 concurrency:
-  group: infinite-task
+  group: long-loop-task
   cancel-in-progress: false
 
 jobs:
   run-loop:
     runs-on: ubuntu-latest
-    # 关键：5小时50分（350分钟）强制超时。留10分钟给后续的重启步骤执行。
-    timeout-minutes: 1
+    # 这里设置 360 分钟（6小时）。因为 Python 会在 5小时45分主动退出，
+    # 这个 timeout 只是用来防止 Python 代码卡死时，被平台强制杀掉。
+    timeout-minutes: 360 
     
     steps:
       - name: Checkout repository
@@ -29,17 +29,17 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Run infinite loop
-        run: python .github/workflows/main.py
-        # 这一步跑满 350 分钟后，会被 GitHub 强行杀掉，状态变为 Failure
+      - name: Run main.py
+        # -u 参数强制实时输出日志，方便你在网页上随时查看进度
+        run: python -u .github/workflows/main.py
 
       - name: Trigger Next Workflow (Restart)
-        # 关键：无论前一步是成功还是超时失败，都强制执行！
-        if: always() 
+        # 关键修改：只有前面正常结束（主动 exit(0)），才执行接力
+        if: success() 
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
-          echo "上一轮任务已终止，正在触发下一轮..."
+          echo "上一轮任务已圆满结束，正在触发下一轮..."
           curl -L \
             -X POST \
             -H "Accept: application/vnd.github+json" \
