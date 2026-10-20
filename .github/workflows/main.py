@@ -8,7 +8,7 @@ def main():
     
     # 设定运行时间：5小时45分钟 = 20700 秒。
     # (留出15分钟余量，确保在GitHub 6小时强制拔电源之前，我们能自己安全退出)
-    MAX_RUN_TIME = 20700 
+    MAX_RUN_TIME = 70 #20700 
 
     count = 0
     while True:
