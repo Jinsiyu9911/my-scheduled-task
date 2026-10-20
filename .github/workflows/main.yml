@@ -1,21 +1,24 @@
-name: My Scheduled Python Task
+name: Infinite Loop Auto Restart
 
 on:
   schedule:
-    # 每天 UTC 时间 3:17（北京时间 11:17）执行。避开整点，防止被平台延迟
-    - cron: '17 3 * * *'
-  # 允许你在网页上手动点击运行，用于测试
+    # 兜底：每天 UTC 0点 触发一次
+    - cron: '0 0 * * *' 
   workflow_dispatch:
 
-# 为后续可能需要的自我触发逻辑预留权限
 permissions:
   actions: write
 
+# 并发控制：确保同一时间只有一个该工作流在运行
+concurrency:
+  group: infinite-task
+  cancel-in-progress: false
+
 jobs:
-  run-python-loop:
+  run-loop:
     runs-on: ubuntu-latest
-    # 设置单次运行超时限制，防止死循环失控
-    timeout-minutes: 60 
+    # 关键：5小时50分（350分钟）强制超时。留10分钟给后续的重启步骤执行。
+    timeout-minutes: 350 
     
     steps:
       - name: Checkout repository
@@ -26,13 +29,21 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Run my Python script
+      - name: Run infinite loop
+        run: python main.py
+        # 这一步跑满 350 分钟后，会被 GitHub 强行杀掉，状态变为 Failure
+
+      - name: Trigger Next Workflow (Restart)
+        # 关键：无论前一步是成功还是超时失败，都强制执行！
+        if: always() 
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
-          echo "开始运行 Python 循环测试..."
-          python -c "
-          import time
-          for i in range(1, 6):
-              print(f'这是第 {i} 次循环: 任务正在运行...')
-              time.sleep(2)
-          print('循环结束，脚本执行成功！')
-          "
+          echo "上一轮任务已终止，正在触发下一轮..."
+          curl -L \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.PAT_TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/main.yml/dispatches \
+            -d '{"ref":"main"}'
