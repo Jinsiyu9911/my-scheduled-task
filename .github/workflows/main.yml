@@ -18,7 +18,7 @@ jobs:
   run-loop:
     runs-on: ubuntu-latest
     # 关键：5小时50分（350分钟）强制超时。留10分钟给后续的重启步骤执行。
-    timeout-minutes: 350 
+    timeout-minutes: 1
     
     steps:
       - name: Checkout repository
