@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     # 这里设置 360 分钟（6小时）。因为 Python 会在 5小时45分主动退出，
     # 这个 timeout 只是用来防止 Python 代码卡死时，被平台强制杀掉。
-    timeout-minutes: 360 
+    timeout-minutes: 350 
     
     steps:
       - name: Checkout repository
