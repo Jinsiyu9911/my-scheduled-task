@@ -55,7 +55,7 @@ WEBHOOK_URL = ""                # 可选：企业微信/钉钉/飞书机器人�
 # 边跑边提交：每 30 分钟把 data/ 里的小文件提交并推回仓库，0 表示关闭。
 # 只提交 CSV/JSON 这类小文件（几 KB/次）；charts/*.bmp 每张近 1MB，
 # 所以图表先转成 PNG 再提交（见 PUBLISH_CHARTS），BMP 本身只留在 artifact 里。
-AUTO_COMMIT_EVERY = 1800
+AUTO_COMMIT_EVERY = 60 # 1800
 COMMIT_FILES = ("meter_data.csv", "latest.json", "alert_state.json",
                 ".last_prune", ".ready_to_commit", ".commit_status")
 
