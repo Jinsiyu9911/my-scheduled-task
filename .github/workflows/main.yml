@@ -1,0 +1,38 @@
+name: My Scheduled Python Task
+
+on:
+  schedule:
+    # 每天 UTC 时间 3:17（北京时间 11:17）执行。避开整点，防止被平台延迟
+    - cron: '17 3 * * *'
+  # 允许你在网页上手动点击运行，用于测试
+  workflow_dispatch:
+
+# 为后续可能需要的自我触发逻辑预留权限
+permissions:
+  actions: write
+
+jobs:
+  run-python-loop:
+    runs-on: ubuntu-latest
+    # 设置单次运行超时限制，防止死循环失控
+    timeout-minutes: 60 
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Run my Python script
+        run: |
+          echo "开始运行 Python 循环测试..."
+          python -c "
+          import time
+          for i in range(1, 6):
+              print(f'这是第 {i} 次循环: 任务正在运行...')
+              time.sleep(2)
+          print('循环结束，脚本执行成功！')
+          "
