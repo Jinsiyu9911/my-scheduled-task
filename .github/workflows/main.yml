@@ -30,7 +30,7 @@ jobs:
           python-version: '3.10'
 
       - name: Run infinite loop
-        run: python main.py
+        run: python .github/workflows/main.py
         # 这一步跑满 350 分钟后，会被 GitHub 强行杀掉，状态变为 Failure
 
       - name: Trigger Next Workflow (Restart)
