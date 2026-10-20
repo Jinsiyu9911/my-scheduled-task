@@ -43,6 +43,7 @@ import sys
 import time
 import urllib.request
 from datetime import datetime
+from pathlib import Path
 
 # ====================== 配置 ======================
 MAX_RUN_TIME = 20700            # 5小时45分钟 = 20700 秒；6 小时硬上限前留 15 分钟余量
@@ -54,9 +55,9 @@ WEBHOOK_URL = ""                # 可选：企业微信/钉钉/飞书机器人�
 # 边跑边提交：每 30 分钟把 data/ 里的小文件提交并推回仓库，0 表示关闭。
 # 只提交 CSV/JSON 这类小文件（几 KB/次）；charts/*.bmp 每张近 1MB，
 # 所以图表先转成 PNG 再提交（见 PUBLISH_CHARTS），BMP 本身只留在 artifact 里。
-AUTO_COMMIT_EVERY = 60 #1800
+AUTO_COMMIT_EVERY = 1800
 COMMIT_FILES = ("meter_data.csv", "latest.json", "alert_state.json",
-                ".last_prune", ".ready_to_commit")
+                ".last_prune", ".ready_to_commit", ".commit_status")
 
 # 图表发布：monitor.py 只会写 BMP（每张约 938KB），直接提交进 git 一个月能涨几百 MB。
 # 这里用标准库 zlib 把它转成同名 PNG（实测 3~7KB）再提交，成本降到 1/150，
@@ -64,6 +65,17 @@ COMMIT_FILES = ("meter_data.csv", "latest.json", "alert_state.json",
 PUBLISH_CHARTS = True
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 数据目录：默认就在 main.py 旁边（.github/workflows/data），但 GitHub 明令禁止
+# GITHUB_TOKEN 提交或修改 `.github/workflows/**` 下的任何文件，会报
+#   refusing to allow a GitHub App to create or update workflow `.../.last_prune`
+#   without `workflows` permission
+# 而 `permissions:` 里没有 workflows 这个键，无法授权。所以 CI 下用 METER_DATA_DIR
+# 把数据指到仓库根的 data/（main.yml 里已设置），代码留在 .github/workflows/ 不动。
+# 相对路径按「启动时的当前目录」解析成绝对路径：子进程的 cwd 是 .github/workflows，
+# 若保留相对路径，monitor.py 会把它解析到 .github/workflows/data 去，又触发同一限制。
+DATA_ROOT = os.path.abspath(
+    os.environ.get("METER_DATA_DIR") or os.path.join(PROJECT_DIR, "data"))
 
 
 # ====================== 工具函数 ======================
@@ -97,7 +109,7 @@ def fetch_webhook_proxy(url):
     就在告警/汇总时把同一条消息推出去（webhook 服务通常有频率限制，这里只推告警类）。
     """
     try:
-        latest_path = os.path.join(PROJECT_DIR, "data", "latest.json")
+        latest_path = os.path.join(DATA_ROOT, "latest.json")
         with open(latest_path, "r", encoding="utf-8") as f:
             latest = json.load(f)
     except OSError:
@@ -167,7 +179,7 @@ def publish_charts(verbose=True):
     """把 charts/ 下新生成的 BMP 转成 PNG（PNG 才会被提交进仓库）。返回转换个数。"""
     if not PUBLISH_CHARTS:
         return 0
-    chart_dir = os.path.join(PROJECT_DIR, "data", "charts")
+    chart_dir = os.path.join(DATA_ROOT, "charts")
     if not os.path.isdir(chart_dir):
         return 0
     converted = 0
@@ -214,13 +226,61 @@ def repo_root():
     return root
 
 
+def _push_token():
+    """取用于推送的 token。
+
+    GITHUB_TOKEN 在「Settings → Actions → Workflow permissions」为只读时无法推送，
+    而且 YAML 里的 permissions 只能降权不能提权。所以优先使用 PAT（GH_PUSH_TOKEN /
+    PAT_TOKEN 环境变量），它本来就带着 contents:write。
+    """
+    for name in ("GH_PUSH_TOKEN", "PAT_TOKEN", "GITHUB_TOKEN"):
+        token = os.environ.get(name) or ""
+        if token.strip():
+            return token.strip()
+    return ""
+
+
+def _remote_url(root):
+    code, out, _ = _git(["remote", "get-url", "origin"], root)
+    return out if code == 0 else ""
+
+
+def _authed_url(root, token):
+    """把 origin 的 https 地址加上 token（仅用于本次 push/pull，不写进 git config）。"""
+    url = _remote_url(root)
+    if not token or not url.startswith("https://") or "github.com" not in url:
+        return ""
+    return url.replace("https://", f"https://x-access-token:{token}@", 1)
+
+
+def _clean(text, token):
+    """把命令输出里的 token 抹掉，防止泄漏到公开的 Actions 日志。"""
+    if not text:
+        return ""
+    if token:
+        text = text.replace(token, "***")
+    return text
+
+
+def _write_commit_status(ok, detail):
+    """把最近一次提交结果写进 data/.commit_status（会被一起提交，仓库里直接可查）。"""
+    try:
+        path = os.path.join(DATA_ROOT, ".commit_status")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                       "ok": ok, "detail": detail[:400]}, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
 def commit_data(verbose=True):
     """把 data/ 里的小文件提交并推回当前分支。返回 True 表示真的提交了。
 
     设计取舍：
       - 只提交 COMMIT_FILES（CSV/JSON，每次增量几 KB）与 charts/*.png，
         不提交 charts/*.bmp（每张约 938KB）与 monitor.log，否则 git 历史会迅速膨胀；
-      - 推送失败（没 PAT、网络抖动）只记日志，绝不打断主循环；
+      - 推送失败（没权限、网络抖动）只记日志并写 .commit_status，绝不打断主循环；
       - 不在 git 仓库里（本地开发）直接跳过。
     """
     root = repo_root()
@@ -229,8 +289,8 @@ def commit_data(verbose=True):
             print("[commit] 跳过：当前目录不在 git 仓库内")
         return False
 
-    data_rel = os.path.relpath(os.path.join(PROJECT_DIR, "data"), root).replace("\\", "/")
-    data_abs = os.path.join(PROJECT_DIR, "data")
+    data_rel = os.path.relpath(DATA_ROOT, root).replace("\\", "/")
+    data_abs = DATA_ROOT
     targets = [f"{data_rel}/{name}" for name in COMMIT_FILES
                if os.path.exists(os.path.join(data_abs, name))]
     # 图表只提交转换后的 PNG（体积约 BMP 的 1/50）
@@ -243,9 +303,13 @@ def commit_data(verbose=True):
             print("[commit] 跳过：data/ 里没有可提交的文件")
         return False
 
+    token = _push_token()
+
     code, _, err = _git(["add", "-A", "--"] + targets, root)
     if code != 0:
+        err = _clean(err, token)
         print(f"[commit] git add 失败: {err}")
+        _write_commit_status(False, f"git add 失败: {err}")
         return False
 
     # Actions 上默认没有 git 身份，缺失时补一个（已配置过就不动用户自己的设置）
@@ -263,25 +327,37 @@ def commit_data(verbose=True):
     msg = f"data: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 电表数据（自动提交）"
     code, _, err = _git(["commit", "-q", "-m", msg], root)
     if code != 0:
+        err = _clean(err, token)
         print(f"[commit] git commit 失败: {err}")
+        _write_commit_status(False, f"git commit 失败: {err}")
         return False
 
     _, sha, _ = _git(["rev-parse", "--short", "HEAD"], root)
     print(f"[commit] 已提交 {sha}: {msg}")
 
     # 推送：接力期间可能有别的运行刚推过，先 rebase 再推，重试 3 次
-    branch = os.environ.get("GITHUB_REF_NAME") or ""
+    branch = os.environ.get("GITHUB_REF_NAME") or "main"
+    authed = _authed_url(root, token)
+    target = authed or "origin"
     for attempt in range(1, 4):
-        if branch:
+        if authed:
+            _git(["pull", "--rebase", "--autostash", target, branch], root)
+        else:
             _git(["pull", "--rebase", "--autostash", "origin", branch], root)
-        code, _, err = _git(["push", "origin", f"HEAD:{branch}" if branch else "HEAD"], root)
+        code, _, err = _git(["push", target, f"HEAD:{branch}"], root)
         if code == 0:
-            print(f"[commit] 已推送 (第 {attempt} 次尝试)")
+            print(f"[commit] 已推送 (第 {attempt} 次尝试) -> origin/{branch}")
+            _write_commit_status(True, f"已推送 {sha}")
             return True
-        print(f"[commit] 推送失败（第 {attempt} 次）: {err[:200]}")
+        err = _clean(err, token)
+        print(f"[commit] 推送失败（第 {attempt} 次）: {err[:300]}")
         time.sleep(2)
 
+    err = _clean(err, token)
     print("[commit] 推送多次失败，数据先留在 runner 上；本轮继续跑")
+    print("[commit] 常见原因：Settings → Actions → General → Workflow permissions "
+          "未设为 Read and write，或 PAT 缺少 contents:write")
+    _write_commit_status(False, f"推送失败: {err[:300]}")
     return True
 
 
@@ -303,10 +379,9 @@ def run_once():
       - monitor.run_once() 内部抓取/存盘失败会 sys.exit(1|2)，子进程隔离后不会带走本循环；
       - 每轮一个干净进程，日志句柄、urllib 连接、进程级状态都不残留。
     """
-    import subprocess
-
     env = dict(os.environ)
     env["_MP_MAIN"] = "1"           # 防止 monitor.py 若将来加了 __main__ 守卫以外的副作用
+    env["METER_DATA_DIR"] = DATA_ROOT   # 让 monitor.py 把数据写到 DATA_ROOT（CI 下是仓库根 data/）
     cmd = [sys.executable, os.path.join(PROJECT_DIR, "monitor.py")]
     t0 = time.time()
     proc = subprocess.run(cmd, cwd=PROJECT_DIR, env=env)
@@ -317,6 +392,15 @@ def run_once():
 def run_once_inline():
     """同一进程内调用 monitor.run_once()（性能更好，但一轮失败会抛 SystemExit）。"""
     import monitor
+    os.environ.setdefault("METER_DATA_DIR", DATA_ROOT)
+    monitor.DATA_DIR = Path(DATA_ROOT)
+    monitor.CHART_DIR = Path(DATA_ROOT) / "charts"
+    monitor.DATA_FILE = Path(DATA_ROOT) / "meter_data.csv"
+    monitor.ALERT_FILE = Path(DATA_ROOT) / "alert_state.json"
+    monitor.LATEST_FILE = Path(DATA_ROOT) / "latest.json"
+    monitor.ALERTS_LOG = Path(DATA_ROOT) / "alerts.log"
+    monitor.LOG_FILE = Path(DATA_ROOT) / "monitor.log"
+    monitor.PRUNE_MARKER = Path(DATA_ROOT) / ".last_prune"
     monitor.setup_console()
     monitor.setup_log()
     try:
@@ -330,7 +414,7 @@ def run_once_inline():
 
 
 # ====================== 接力退出标记 ======================
-READY_MARKER = os.path.join(PROJECT_DIR, "data", ".ready_to_commit")
+READY_MARKER = os.path.join(DATA_ROOT, ".ready_to_commit")
 
 
 def _mark_ready_for_commit(delay=3.0):
@@ -392,7 +476,7 @@ def main(argv=None):
 
     count = 0
     failures = 0
-    last_commit = time.time()
+    last_commit = 0          # 0 => 第一轮就提交一次，不用等到第一个间隔
     while True:
         count += 1
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

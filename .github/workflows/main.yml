@@ -29,7 +29,7 @@ concurrency:
 env:
   # runner 默认 UTC。设成北京时间，CSV 时间戳、每日 22:00 汇总、图表坐标轴才符合预期。
   TZ: Asia/Shanghai
-  DATA_DIR: .github/workflows/data
+  DATA_DIR: data                     # 数据放仓库根目录：GITHUB_TOKEN 不允许写 .github/workflows/**
 
 jobs:
   run-loop:
@@ -56,15 +56,23 @@ jobs:
 
       - name: Run main.py
         # -u：强制实时输出，方便在网页上随时看进度。
-        # main.py 每 30 分钟会把 data/ 里的小文件（CSV/JSON）提交并推回仓库，
-        # 所以跑起来后半小时内就能在仓库里看到文件，不用等 5h45m 结束。
-        # 图表（BMP 较大）不频繁提交，改为随 artifact 一起打包（见后面的步骤）。
+        # 数据目录用 METER_DATA_DIR 指到仓库根的 data/：GitHub 明确禁止 GITHUB_TOKEN
+        # 提交 `.github/workflows/**` 下的任何文件（会报 refusing to allow a GitHub App
+        # to create or update workflow ... without `workflows` permission），
+        # 而 permissions 里没有 workflows 这个键可以开，所以数据必须放在别的目录。
+        # main.py 每 30 分钟会把 data/ 里的小文件（CSV/JSON/PNG）提交并推回仓库。
         env:
           MAX_RUN: ${{ github.event.inputs.max_run }}
+          METER_DATA_DIR: data
+          # 推送用 PAT：仓库若把 Workflow 权限设成只读，GITHUB_TOKEN 推不上去，
+          # 而 YAML 里的 permissions 只能降权不能提权。只传进环境变量，不打印。
+          GH_PUSH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           ARGS=""
           if [ -n "${MAX_RUN}" ]; then ARGS="--max-run ${MAX_RUN}"; fi
           echo "启动参数: ${ARGS:-（默认 5h45m）}"
+          if [ -n "${GH_PUSH_TOKEN}" ]; then echo "推送凭证: 使用 secrets.PAT_TOKEN"; 
+          else echo "::warning::没有 PAT_TOKEN，推送将退回使用 GITHUB_TOKEN（可能是只读）"; fi
           python -u .github/workflows/main.py ${ARGS}
 
       - name: Commit data（兜底提交，有变化才提交）
@@ -82,11 +90,12 @@ jobs:
             echo "data/ 无变化，跳过提交"
           else
             git commit -m "data: $(date '+%Y-%m-%d %H:%M %Z') 电表数据"
+            # 推送失败只告警，不弄挂 job：否则接力链会断（数据其实已由 main.py 定期提交过）
             for i in 1 2 3; do
               git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && \
               git push origin "HEAD:${GITHUB_REF_NAME}" && break
-              echo "push 第 $i 次失败，2 秒后重试"; sleep 2
-            done
+              echo "::warning::push 第 $i 次失败，2 秒后重试"; sleep 2
+            done || echo "::warning::兜底提交推送失败，本轮数据仍留在 runner 上"
           fi
 
       - name: Upload charts（本次运行的图表与日志）
@@ -97,9 +106,9 @@ jobs:
         with:
           name: meter-charts-${{ github.run_number }}
           path: |
-            .github/workflows/data/charts/*.bmp
-            .github/workflows/data/monitor.log
-            .github/workflows/data/alerts.log
+            data/charts/*.bmp
+            data/monitor.log
+            data/alerts.log
           retention-days: 14
           if-no-files-found: ignore
 
@@ -138,6 +147,13 @@ jobs:
             if [ -f "$DATA_DIR/latest.json" ]; then
               echo '```json'
               cat "$DATA_DIR/latest.json"
+              echo '```'
+            fi
+            if [ -f "$DATA_DIR/.commit_status" ]; then
+              echo ""
+              echo "**最近一次自动提交**"
+              echo '```json'
+              cat "$DATA_DIR/.commit_status"
               echo '```'
             fi
             echo ""

@@ -70,9 +70,11 @@ TOAST_APP_IDS = [
 TOAST_APP_IDS = [a for a in TOAST_APP_IDS if a]
 NOTIFY_TIMEOUT = 20             # 单次 PowerShell 调用超时（秒）
 
-# 路径（数据放在脚本所在目录的 data/ 下，与 Termux 版一致）
+# 路径（默认放在脚本所在目录的 data/ 下，与 Termux 版一致）
+# 可用环境变量 METER_DATA_DIR 指定别的数据目录：GitHub Actions 禁止 GITHUB_TOKEN
+# 提交/修改 `.github/workflows/**` 下的任何文件，所以 CI 里要把数据放到仓库其他位置。
 PROJECT_DIR = Path(__file__).resolve().parent
-DATA_DIR = PROJECT_DIR / "data"
+DATA_DIR = Path(os.environ.get("METER_DATA_DIR") or (PROJECT_DIR / "data"))
 CHART_DIR = DATA_DIR / "charts"
 DATA_FILE = DATA_DIR / "meter_data.csv"     # UTF-8 with BOM：Excel 双击打开中文不乱码
 ALERT_FILE = DATA_DIR / "alert_state.json"
