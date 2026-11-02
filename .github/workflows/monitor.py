@@ -11,9 +11,13 @@ r"""
     1) 24 小时图：每小时一根柱子（hourly_chart.bmp）
     2) 14 天日图：每天一根柱子（daily_chart.bmp）
     3) 12 个月图：每月一根柱子，近一年（monthly_chart.bmp）
-  月用量单独记在 monthly_data.csv（每月一行），因为主 CSV 只留 14 天、跨月会丢月初读数。
-- 数据保留期：明细 CSV 只留最近 RETENTION_DAYS(=14) 天，charts\ 只留 14 天内的快照，
-  月用量表留最近 MONTHLY_KEEP(=12) 个月；过期内容每天自动清理一次。
+  月用量不再单独建表：明细 CSV 采用分级保留（14 天内全量、更旧的每天 2 条、最多 12 个月），
+  月用量直接由它累加得出。详见 _prune_csv / _monthly_usage_from_csv。
+- 数据保留期（分级，都集中在同一张明细 CSV 里）：
+    · 最近 RETENTION_DAYS(=14) 天：全部分钟级记录（24h 图、14 天图要用）
+    · 更旧、但在 MONTHLY_KEEP(=12) 个月内：每天只留首末两条（月用量照样算得准）
+    · 早于 12 个月：删除
+    · charts\ 只留 14 天内的快照；以上清理每天自动执行一次
 
 用法:
     python  monitor.py                # 单次采集（交给「任务计划程序」每分钟触发）
@@ -21,6 +25,7 @@ r"""
     python  monitor.py --chart        # 生成三张图（24h / 14天 / 12月），调试用
     python  monitor.py --test-notify  # 发一条测试 Toast，验证通知链路
     python  monitor.py --prune        # 立刻按保留期清理，不等每日自动清理
+    python  monitor.py --audit        # 体检：三张图所需数据是否完整（缺口会标出来）
 
 注册为登录自启:
     schtasks /create /tn "电表监控" /sc ONLOGON /f ^
@@ -84,14 +89,13 @@ CHART_DIR = DATA_DIR / "charts"
 DATA_FILE = DATA_DIR / "meter_data.csv"     # UTF-8 with BOM：Excel 双击打开中文不乱码
 # 月度用量单独一张表：主 CSV 只保留 RETENTION_DAYS(14) 天，跨月就会丢掉月初读数，
 # 无法反推整月用量。这里每个月一行、只记汇总（最多 MONTHLY_KEEP 行），文件极小。
-MONTHLY_FILE = DATA_DIR / "monthly_data.csv"
-MONTHLY_FIELDS = ['month', 'kwh', 'days', 'samples', 'first_kwh', 'last_kwh', 'last_date', 'updated']
 ALERT_FILE = DATA_DIR / "alert_state.json"
 LATEST_FILE = DATA_DIR / "latest.json"
 ALERTS_LOG = DATA_DIR / "alerts.log"
 LOG_FILE = DATA_DIR / "monitor.log"
 PRUNE_MARKER = DATA_DIR / ".last_prune"
 LOG_MAX_BYTES = 2 * 1024 * 1024
+ALERTS_LOG_MAX = 1024 * 1024      # alerts.log 超过 1MB 滚动为 alerts.log.1
 
 
 # ====================== 控制台 / 日志 ======================
@@ -357,93 +361,6 @@ def save_data(kwh, status):
     }
     LATEST_FILE.write_text(json.dumps(latest, ensure_ascii=False), encoding='utf-8')
 
-    # 同步累计当月用量（失败不影响采集主流程）
-    try:
-        update_monthly_usage(kwh)
-    except Exception as e:
-        print(f"  [月] 月度数据更新失败: {type(e).__name__}: {e}")
-
-
-# ====================== 月度用量（近一年） ======================
-def _read_monthly():
-    """读取 monthly_data.csv，返回 {month: row}。文件缺失或损坏时返回空字典。"""
-    if not MONTHLY_FILE.exists():
-        return {}
-    try:
-        with open(MONTHLY_FILE, 'r', encoding='utf-8-sig', newline='') as f:
-            return {r['month']: r for r in csv.DictReader(f) if r.get('month')}
-    except Exception:
-        return {}
-
-
-def _write_monthly(rows):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = MONTHLY_FILE.with_name(MONTHLY_FILE.name + '.tmp')
-    with open(tmp, 'w', encoding='utf-8-sig', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=MONTHLY_FIELDS)
-        writer.writeheader()
-        for month in sorted(rows):
-            writer.writerow({k: rows[month].get(k, '') for k in MONTHLY_FIELDS})
-    os.replace(tmp, MONTHLY_FILE)      # 原子替换，避免读到写了一半的文件
-
-
-def update_monthly_usage(kwh):
-    """把本次读数并入「当月用量」，只保留最近 MONTHLY_KEEP 个月（近一年）。
-
-    为什么不用主 CSV 反推整月用量：主 CSV 只保留 14 天，跨月就丢了月初读数。
-    这里用增量累加，永远只需要「上一次读数」：
-        本月用量 += max(0, 上次读数 - 本次读数)
-    读数为负增量（中途充值，电量反升）时记 0，充值不算消耗。
-    月初第一次采到新月份时以当前读数做基线，当月从 0 开始累积
-    （跨月那一个采集间隔的消耗会算进上月，最多差一分钟，可忽略）。
-    """
-    if kwh is None:
-        return None
-
-    now = datetime.now()
-    month_key = now.strftime('%Y-%m')
-    today_key = now.strftime('%Y-%m-%d')
-    stamp = now.strftime('%Y-%m-%d %H:%M:%S')
-    rows = _read_monthly()
-    rec = rows.get(month_key)
-
-    if rec is None:
-        rows[month_key] = {
-            'month': month_key,
-            'kwh': '0.0000',
-            'days': '1',
-            'samples': '1',
-            'first_kwh': f'{kwh}',
-            'last_kwh': f'{kwh}',
-            'last_date': today_key,
-            'updated': stamp,
-        }
-    else:
-        try:
-            prev = float(rec.get('last_kwh') or '')
-        except ValueError:
-            prev = None
-        try:
-            total = float(rec.get('kwh') or 0)
-        except ValueError:
-            total = 0.0
-        if prev is not None and prev >= kwh:
-            total += prev - kwh
-        rec['kwh'] = f'{total:.4f}'
-        rec['samples'] = str(int(rec.get('samples') or 0) + 1)
-        if rec.get('last_date') != today_key:      # 跨天：天数 +1
-            rec['days'] = str(int(rec.get('days') or 0) + 1)
-            rec['last_date'] = today_key
-        rec['last_kwh'] = f'{kwh}'
-        rec['updated'] = stamp
-
-    # 只保留最近 MONTHLY_KEEP 个月
-    for old in sorted(rows)[:-MONTHLY_KEEP]:
-        rows.pop(old, None)
-
-    _write_monthly(rows)
-    return rows[month_key]
-
 
 def load_alert_state():
     if ALERT_FILE.exists():
@@ -462,13 +379,23 @@ def save_alert_state(state):
 
 # ====================== 保留期清理（最多留 2 周） ======================
 def _prune_csv():
-    """把 CSV 裁剪到最近 RETENTION_DAYS 天，返回删除的行数。"""
+    """裁剪明细 CSV，返回 (删除行数, 降采样省下的行数)。
+
+    单表要同时支撑「最近 24 小时图 / 14 天日图 / 12 个月月报」，所以不是简单删旧行，
+    而是分级保留（这样月用量仍能只靠这一张表算出来，不需要第二张月表）：
+
+      1) 最近 RETENTION_DAYS 天：保留全部记录（分钟级）——24h 图、24h 消耗统计要用；
+      2) 更早、但还在最近 MONTHLY_KEEP 个月内：每天只保留「当天第一条 + 最后一条」。
+         月用量 = 按时间顺序逐行累加 max(0, 上次读数 - 本次读数)，
+         一天两条就足够算出这一整天的用量，所以粗粒度也不丢数；
+      3) 早于 MONTHLY_KEEP 个月：删除。
+    """
     if not DATA_FILE.exists():
-        return 0
-    cutoff = datetime.now() - timedelta(days=RETENTION_DAYS)
+        return 0, 0
+
     fieldnames = ['timestamp', 'kwh', 'status']
-    kept = []
-    removed = 0
+    rows = []
+    dropped = 0
     try:
         with open(DATA_FILE, 'r', encoding='utf-8-sig', newline='') as f:
             reader = csv.DictReader(f)
@@ -478,19 +405,44 @@ def _prune_csv():
                     t = datetime.strptime(str(row.get('timestamp', '')),
                                           '%Y-%m-%d %H:%M:%S')
                 except (ValueError, TypeError):
-                    removed += 1        # 时间戳坏掉的行一并丢掉
+                    dropped += 1        # 时间戳坏掉的行一并丢掉
                     continue
-                if t >= cutoff:
-                    kept.append(row)
-                else:
-                    removed += 1
+                rows.append((t, row))
     except OSError as e:
         print(f"  [清理] CSV 读取失败: {e}")
-        return 0
+        return 0, 0
 
-    if removed == 0:
-        return 0
+    rows.sort(key=lambda x: x[0])
+    now = datetime.now()
+    cutoff_full = now - timedelta(days=RETENTION_DAYS)
+    month_floor = _add_months(now.replace(day=1, hour=0, minute=0, second=0,
+                                          microsecond=0), -(MONTHLY_KEEP - 1))
 
+    recent = [row for t, row in rows if t >= cutoff_full]
+    middle = [(t, row) for t, row in rows if month_floor <= t < cutoff_full]
+    removed = dropped + len([1 for t, _ in rows if t < month_floor])
+
+    # 中间区间（超过 14 天、但还在 12 个月内）按天降采样成首末两条
+    per_day = {}
+    for t, row in middle:
+        key = t.strftime('%Y-%m-%d')
+        slot = per_day.get(key)
+        if slot is None:
+            per_day[key] = [row, row]
+        else:
+            slot[1] = row
+    kept_middle = []
+    for key in sorted(per_day):
+        first, last = per_day[key]
+        kept_middle.append(first)
+        if last is not first:
+            kept_middle.append(last)
+    compressed = len(middle) - len(kept_middle)
+
+    if removed == 0 and compressed == 0:
+        return 0, 0
+
+    kept = kept_middle + recent          # 中间区间都早于 recent，顺序天然正确
     tmp = DATA_FILE.with_name(DATA_FILE.name + '.tmp')
     try:
         with open(tmp, 'w', encoding='utf-8-sig', newline='') as f:
@@ -505,20 +457,27 @@ def _prune_csv():
             tmp.unlink()
         except OSError:
             pass
-        return 0
-    return removed
+        return 0, 0
+    return removed, compressed
 
 
 def _prune_charts():
     """删掉 charts/ 下超过 RETENTION_DAYS 天的图表快照，返回删除个数。
 
-    只处理 hourly_chart_<后缀>.bmp 这种快照；hourly_chart.bmp 是实时图，每次覆盖，不动。
+    只处理 `*_chart_<后缀>.bmp/.png` 这种快照（每日汇总时存的那份）；
+    hourly_chart / daily_chart / monthly_chart 这三张是常驻图，每次覆盖，不动。
+    PNG 也要一起清：main.py 会把快照转成 PNG 提交进仓库，只删 BMP 的话
+    「图表只留 14 天」这个承诺在仓库里并不成立。
     """
     if not CHART_DIR.is_dir():
         return 0
     cutoff_ts = (datetime.now() - timedelta(days=RETENTION_DAYS)).timestamp()
     removed = 0
-    for path in CHART_DIR.glob('hourly_chart_*.bmp'):
+    try:
+        candidates = list(CHART_DIR.glob('*_chart_*.bmp')) + list(CHART_DIR.glob('*_chart_*.png'))
+    except OSError:
+        return 0
+    for path in candidates:
         try:
             if path.stat().st_mtime < cutoff_ts:
                 path.unlink()
@@ -528,22 +487,46 @@ def _prune_charts():
     return removed
 
 
-def _prune_monthly():
-    """月用量表只保留最近 MONTHLY_KEEP 个月，返回删除的行数。"""
-    rows = _read_monthly()
-    if not rows:
-        return 0
-    old = sorted(rows)[:-MONTHLY_KEEP]
-    if not old:
-        return 0
-    for month in old:
-        rows.pop(month, None)
-    _write_monthly(rows)
-    return len(old)
+def _cleanup_stale_files():
+    """清掉不该残留的文件，返回删除个数。
+
+    覆盖三类历史包袱：
+      1) 已废弃的 monthly_data.csv（旧版把月用量单独存表，现在改成单表汇总了）；
+      2) 原子重写失败时可能留下的 *.tmp；
+      3) 过大的 alerts.log（只在通知失败时才写，之前没有任何清理策略）：
+         超过 ALERTS_LOG_MAX 就滚动成 alerts.log.1（覆盖旧的那份）。
+    """
+    removed = 0
+    legacy = DATA_DIR / "monthly_data.csv"
+    try:
+        if legacy.exists():
+            legacy.unlink()
+            removed += 1
+            print("  [清理] 删除已废弃的 monthly_data.csv（月用量已改由明细 CSV 汇总）")
+    except OSError:
+        pass
+
+    try:
+        for tmp in DATA_DIR.glob("*.tmp"):
+            tmp.unlink()
+            removed += 1
+    except OSError:
+        pass
+
+    try:
+        if ALERTS_LOG.exists() and ALERTS_LOG.stat().st_size > ALERTS_LOG_MAX:
+            os.replace(ALERTS_LOG, ALERTS_LOG.with_name(ALERTS_LOG.name + ".1"))
+            removed += 1
+    except OSError:
+        pass
+    return removed
 
 
 def prune_storage(force=False):
-    """按保留期清理 CSV、图表与月用量表。默认每天只做一次（用 data/.last_prune 记录日期）。"""
+    """按保留期清理：明细 CSV（分级）、图表快照、日志与残留文件。
+
+    默认每天只做一次（用 data/.last_prune 记录日期），避免每分钟重写大文件。
+    """
     today = datetime.now().strftime('%Y-%m-%d')
     if not force:
         try:
@@ -552,9 +535,9 @@ def prune_storage(force=False):
         except OSError:
             pass
 
-    removed_rows = _prune_csv()
+    removed_rows, compressed = _prune_csv()
     removed_files = _prune_charts()
-    removed_months = _prune_monthly()
+    removed_stale = _cleanup_stale_files()
 
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -562,10 +545,10 @@ def prune_storage(force=False):
     except OSError:
         pass
 
-    if removed_rows or removed_files or removed_months:
-        print(f"  [清理] 保留 {RETENTION_DAYS} 天 / {MONTHLY_KEEP} 个月："
-              f"CSV 删除 {removed_rows} 行，图表删除 {removed_files} 个，"
-              f"月表删除 {removed_months} 行")
+    if removed_rows or compressed or removed_files or removed_stale:
+        print(f"  [清理] CSV 删除 {removed_rows} 行（早于 {MONTHLY_KEEP} 个月）、"
+              f"降采样省下 {compressed} 行（早于 {RETENTION_DAYS} 天改为每天 2 条）；"
+              f"图表快照删除 {removed_files} 个；残留/日志 {removed_stale} 个")
 
 
 # ====================== 告警逻辑 ======================
@@ -835,24 +818,22 @@ def generate_hourly_chart(suffix: str = ""):
         if t < start_time or t > end_time:
             continue
         hour_key = t.replace(minute=0, second=0, microsecond=0)
-        if hour_key not in hourly:
-            hourly[hour_key] = {"first": (t, k), "last": (t, k)}
-        else:
-            if t < hourly[hour_key]["first"][0]:
-                hourly[hour_key]["first"] = (t, k)
-            if t > hourly[hour_key]["last"][0]:
-                hourly[hour_key]["last"] = (t, k)
+        hourly.setdefault(hour_key, []).append((t, k))
 
+    # 小时用量 = 该小时内「逐段累加 max(0, 上次读数 - 本次读数)」
+    # 与月用量同一套规则：中途充值（电量反升）那一步记 0，充值不算消耗，
+    # 后面的读数继续做基线，所以充值那个小时也能正确显示充值前后用掉的电量。
     hour_consumption = {}
-    for hk, hd in hourly.items():
-        first_kwh = hd["first"][1]
-        last_kwh = hd["last"][1]
-        # 同一小时内电量反升（中途充值）时无法算出消耗，该小时按缺失处理
-        if first_kwh is not None and last_kwh is not None and first_kwh >= last_kwh:
-            hour_consumption[hk] = round(first_kwh - last_kwh, 4)
+    for hk, pts in hourly.items():
+        pts.sort(key=lambda x: x[0])
+        used = 0.0
+        for (_, prev_k), (_, cur_k) in zip(pts, pts[1:]):
+            if prev_k >= cur_k:
+                used += prev_k - cur_k
+        hour_consumption[hk] = round(used, 4)
 
-    if not hour_consumption:
-        print("  [图表] 时间范围内无有效小时数据，跳过")
+    if not any(len(pts) >= 2 for pts in hourly.values()):
+        print("  [图表] 时间范围内每小时都只有单点记录，算不出消耗，跳过")
         return None
 
     hours_list = []
@@ -931,11 +912,8 @@ def generate_hourly_chart(suffix: str = ""):
 
     for idx, hk in enumerate(hours_list):
         val = hour_consumption.get(hk, 0)
-        hd = hourly.get(hk)
-        if hd:
-            span_min = int((hd["last"][0] - hd["first"][0]).total_seconds() // 60)
-        else:
-            span_min = 0
+        pts = hourly.get(hk)
+        span_min = int((pts[-1][0] - pts[0][0]).total_seconds() // 60) if pts else 0
         bh = int(val / max_val * ch_h) if max_val > 0 else 0
         bx = int(LFT + idx * gap + (gap - bar_w) / 2)
         by = TOP + ch_h - bh
@@ -1019,25 +997,23 @@ def generate_daily_chart():
         day = t.replace(hour=0, minute=0, second=0, microsecond=0)
         if day < first_day or day > today:
             continue
-        if day not in per_day:
-            per_day[day] = {"first": (t, k), "last": (t, k)}
-        else:
-            if t < per_day[day]["first"][0]:
-                per_day[day]["first"] = (t, k)
-            if t > per_day[day]["last"][0]:
-                per_day[day]["last"] = (t, k)
+        per_day.setdefault(day, []).append((t, k))
 
+    # 当天用量 = 当天「逐段累加 max(0, 上次读数 - 本次读数)」，与小时图/月图同一套规则：
+    # 中途充值那一步记 0，充值前后的消耗都保留，不会因为充值整根柱子变 0。
     day_consumption = {}
     day_span_hours = {}
-    for day, dd in per_day.items():
-        first_kwh, last_kwh = dd["first"][1], dd["last"][1]
-        day_span_hours[day] = (dd["last"][0] - dd["first"][0]).total_seconds() / 3600
-        # 当天电量反升（中途充值）时无法算出消耗，该天按缺失处理
-        if first_kwh is not None and last_kwh is not None and first_kwh >= last_kwh:
-            day_consumption[day] = round(first_kwh - last_kwh, 4)
+    for day, pts in per_day.items():
+        pts.sort(key=lambda x: x[0])
+        used = 0.0
+        for (_, prev_k), (_, cur_k) in zip(pts, pts[1:]):
+            if prev_k >= cur_k:
+                used += prev_k - cur_k
+        day_consumption[day] = round(used, 4)
+        day_span_hours[day] = (pts[-1][0] - pts[0][0]).total_seconds() / 3600
 
-    if not day_consumption:
-        print("  [日图] 时间范围内无有效日数据，跳过")
+    if not any(len(pts) >= 2 for pts in per_day.values()):
+        print("  [日图] 时间范围内每天都只有单点记录，算不出消耗，跳过")
         return None
 
     values = [day_consumption.get(d, 0) for d in days]
@@ -1136,16 +1112,67 @@ def _add_months(dt, n):
     return dt.replace(year=total // 12, month=total % 12 + 1)
 
 
+def _monthly_usage_from_csv():
+    """只从明细 CSV 汇总每个月的用量（不需要额外的月表）。
+
+    做法：把明细行按时间排序，逐行累加 max(0, 上次读数 - 本次读数)：
+      - 充值导致读数反升时该步记 0，充值不算消耗，下一次读数继续做基线；
+      - 跨月的第一个读数不参与累加（那一段消耗归上一个月，最多差一个采集间隔）。
+
+    之所以只靠明细 CSV 就够：_prune_csv 只把「超过 RETENTION_DAYS 天」的行降采样成
+    每天首末两条，而一天两条正好能算出这一天整天的用量，所以 12 个月内的月用量仍然精确。
+
+    返回 {'YYYY-MM': {'kwh': float, 'days': int, 'samples': int}}。
+    """
+    months = {}
+    if not DATA_FILE.exists():
+        return months
+    try:
+        with open(DATA_FILE, 'r', encoding='utf-8-sig', newline='') as f:
+            rows = list(csv.DictReader(f))
+    except Exception:
+        return months
+
+    records = []
+    for r in rows:
+        try:
+            t = datetime.strptime(r['timestamp'], '%Y-%m-%d %H:%M:%S')
+            k = float(r['kwh'])
+        except (ValueError, KeyError, TypeError):
+            continue
+        records.append((t, k))
+    records.sort(key=lambda x: x[0])
+
+    prev = None
+    for t, k in records:
+        key = t.strftime('%Y-%m')
+        m = months.get(key)
+        if m is None:
+            m = months[key] = {'kwh': 0.0, 'days': 0, 'samples': 0, 'dates': set()}
+            # 注意：这里**不清空** prev。跨月（或中间断档）时，「上个月最后一条 → 本月第一条」
+            # 这段消耗属于新月份，计入本月，否则月初那一段（断档时可能是好几天）会凭空消失。
+        if prev is not None and prev >= k:
+            m['kwh'] += prev - k
+        prev = k
+        m['dates'].add(t.strftime('%Y-%m-%d'))
+        m['samples'] += 1
+
+    for m in months.values():
+        m['days'] = len(m.pop('dates'))
+    return months
+
+
 def generate_monthly_chart():
     """生成「最近 MONTHLY_KEEP 个月（近一年）、每月一根柱子」的 BMP 柱状图。
 
-    数据来自 monthly_data.csv（每月一行汇总），因为主 CSV 只留 14 天、跨月就丢了月初读数。
+    用量直接由明细 CSV 汇总（见 _monthly_usage_from_csv），不依赖额外的月表：
+    明细 CSV 里超过 14 天的旧数据被降采样成每天 2 条，但月用量照样能算准。
     量取的是整月用量（当月 1 日到月底）；当月是进行中的月份，柱子会偏短，
     柱底标注该月已统计的天数，方便判断是否满月。
     """
-    rows = _read_monthly()
+    rows = _monthly_usage_from_csv()
     if not rows:
-        print("  [月图] 还没有月用量数据，跳过")
+        print("  [月图] 明细 CSV 里还没有月度数据，跳过")
         return None
 
     cur_month = _month_start(datetime.now())
@@ -1257,6 +1284,96 @@ def generate_monthly_chart():
     print(f"  [月图] 已生成: {chart_path} ({len(months)}个月, {n_months}个月有数据, "
           f"近一年合计 {total_kwh:.2f}kWh, {len(data)}B)")
     return chart_path
+
+
+# ====================== 数据完整性体检 ======================
+def audit_coverage():
+    """检查三张图各自需要的数据窗口是否都还在 CSV 里，打印体检报告。
+
+    三张图的数据需求不同，保留策略必须同时满足它们：
+      · 24 小时图：需要最近 24h 的分钟级记录
+      · 14 天日图：需要 today-13 起的每天首末记录
+      · 12 个月月图：需要「11 个月前的 1 日」起的记录
+    这个命令把「需要什么」和「CSV 里实际有什么」逐项对一遍，缺口会直接标出来。
+    """
+    print("═" * 52)
+    print("数据完整性体检")
+    print("═" * 52)
+
+    if not DATA_FILE.exists():
+        print(f"✗ 明细 CSV 不存在: {DATA_FILE}")
+        return 1
+
+    records = []
+    bad = 0
+    with open(DATA_FILE, 'r', encoding='utf-8-sig', newline='') as f:
+        for r in csv.DictReader(f):
+            try:
+                records.append((datetime.strptime(r['timestamp'], '%Y-%m-%d %H:%M:%S'),
+                                float(r['kwh'])))
+            except (ValueError, KeyError, TypeError):
+                bad += 1
+    records.sort(key=lambda x: x[0])
+    if not records:
+        print("✗ CSV 里没有有效记录")
+        return 1
+
+    now = datetime.now()
+    oldest, newest = records[0][0], records[-1][0]
+    size_mb = DATA_FILE.stat().st_size / 1024 / 1024
+    print(f"明细 CSV : {len(records)} 行（坏行 {bad}）, {size_mb:.2f} MB")
+    print(f"时间范围 : {oldest:%Y-%m-%d %H:%M} ~ {newest:%Y-%m-%d %H:%M}"
+          f"（滞后 {(now - newest).total_seconds() / 60:.0f} 分钟）")
+
+    per_day = {}
+    for t, _ in records:
+        per_day.setdefault(t.strftime('%Y-%m-%d'), []).append(t)
+
+    # --- 24 小时图 ---
+    h_start = now - timedelta(hours=24)
+    in_win = [t for t, _ in records if t >= h_start]
+    hours = len({t.strftime('%Y-%m-%d %H') for t in in_win})
+    ok = oldest <= h_start
+    print(f"\n[24 小时图] 需要 {h_start:%m-%d %H:%M} 起 → "
+          f"{'✓ 覆盖' if ok else '✗ 缺口'}（窗口内 {len(in_win)} 条 / {hours} 个小时有数据）")
+
+    # --- 14 天日图 ---
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    days = [today - timedelta(days=DAILY_CHART_DAYS - 1 - i) for i in range(DAILY_CHART_DAYS)]
+    missing = [d for d in days if d.strftime('%Y-%m-%d') not in per_day]
+    print(f"[14 天日图 ] 需要 {days[0]:%m-%d} ~ {days[-1]:%m-%d} → "
+          f"{'✓ 14 天都有数据' if not missing else '✗ 缺 ' + ','.join(d.strftime('%m-%d') for d in missing)}"
+          f"（CSV 最早 {oldest:%m-%d}）")
+
+    # --- 12 个月月图 ---
+    months = _monthly_usage_from_csv()
+    cur = _month_start(now)
+    win = [_add_months(cur, -(MONTHLY_KEEP - 1 - i)) for i in range(MONTHLY_KEEP)]
+    floor = win[0]
+    print(f"[12 个月图 ] 需要 {floor:%Y-%m} 起 → "
+          f"{'✓ 覆盖' if oldest <= floor else '△ CSV 只到 ' + oldest.strftime('%Y-%m') + '（更早的月份记 0）'}")
+    for m in win:
+        info = months.get(m.strftime('%Y-%m'))
+        if info:
+            print(f"    {m:%Y-%m}  {info['kwh']:8.2f} kWh  {info['days']:2d} 天  {info['samples']:5d} 条")
+        else:
+            print(f"    {m:%Y-%m}  {'—':>8}      0 天      0 条   (无数据)")
+
+    # --- 图表与日志 ---
+    snaps = sorted(CHART_DIR.glob('*_chart_*.bmp')) + sorted(CHART_DIR.glob('*_chart_*.png')) \
+        if CHART_DIR.is_dir() else []
+    li = [f"{p.name}" for p in CHART_DIR.glob('*_chart.bmp')] if CHART_DIR.is_dir() else []
+    print(f"\n常驻图 : {', '.join(sorted(li)) or '（还没生成）'}")
+    print(f"快照   : {len(snaps)} 个（保留 {RETENTION_DAYS} 天）")
+    for name, path, limit in (("monitor.log", LOG_FILE, LOG_MAX_BYTES),
+                              ("alerts.log", ALERTS_LOG, ALERTS_LOG_MAX)):
+        if path.exists():
+            print(f"{name:<11}: {path.stat().st_size / 1024:.1f} KB "
+                  f"（超过 {limit / 1024 / 1024:.1f} MB 会滚动）")
+        else:
+            print(f"{name:<11}: 无")
+    print("═" * 52)
+    return 0
 
 
 # ====================== 主流程 ======================
@@ -1380,6 +1497,8 @@ def parse_args(argv=None):
                    help="发一条测试 Toast 后退出，验证通知链路")
     p.add_argument("--prune", action="store_true",
                    help=f"立刻按保留期（{RETENTION_DAYS} 天）清理 CSV 与图表后退出")
+    p.add_argument("--audit", action="store_true",
+                   help="体检：打印三张图所需数据窗口的覆盖情况后退出")
     p.add_argument("--no-log", action="store_true", help="不写 data/monitor.log")
     return p.parse_args(argv)
 
@@ -1407,8 +1526,11 @@ def main(argv=None):
 
     if args.prune:
         prune_storage(force=True)
-        print(f"[清理] 完成（保留 {RETENTION_DAYS} 天）")
+        print(f"[清理] 完成（保留 {RETENTION_DAYS} 天 / {MONTHLY_KEEP} 个月）")
         return 0
+
+    if args.audit:
+        return audit_coverage()
 
     if not args.loop:
         run_once()
