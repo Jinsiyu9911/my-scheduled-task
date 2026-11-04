@@ -56,8 +56,8 @@ WEBHOOK_URL = ""                # 可选：企业微信/钉钉/飞书机器人�
 # 只提交 CSV/JSON 这类小文件（几 KB/次）；charts/*.bmp 每张近 1MB，
 # 所以图表先转成 PNG 再提交（见 PUBLISH_CHARTS），BMP 本身只留在 artifact 里。
 AUTO_COMMIT_EVERY = 1800
-COMMIT_FILES = ("meter_data.csv", "monthly_data.csv", "latest.json",
-                "alert_state.json", ".last_prune", ".ready_to_commit", ".commit_status")
+COMMIT_FILES = ("meter_data.csv", "latest.json", "alert_state.json",
+                ".last_prune", ".ready_to_commit", ".commit_status")
 
 # 图表发布：monitor.py 只会写 BMP（每张约 938KB），直接提交进 git 一个月能涨几百 MB。
 # 这里用标准库 zlib 把它转成同名 PNG（实测 3~7KB）再提交，成本降到 1/150，
@@ -515,12 +515,18 @@ def main(argv=None):
             commit_data()
             return code
 
-        # 图表整点生成后，立刻转成 PNG 备提交（只有整点那一轮会真的转换）
-        publish_charts(verbose=False)
-
-        # 边跑边提交：到点就把 data/ 里的小文件推回仓库，
-        # 这样网页上随时能看到 CSV，也不用怕 6 小时中途被取消导致数据全丢
-        last_commit = _maybe_commit(last_commit)
+        # 图表整点生成后立刻转成 PNG；只要有图更新，就马上提交推送，
+        # 不等下一个 --commit-every 到点 —— 否则整点生成的图要等半小时才出现在仓库里，
+        # 提交时间戳看起来"完全不准点"。
+        fresh_charts = publish_charts(verbose=False)
+        if fresh_charts:
+            print(f"[main] 有 {fresh_charts} 张图更新，立即提交推送（不等自动提交间隔）")
+            commit_data(verbose=False)
+            last_commit = time.time()
+        else:
+            # 边跑边提交：到点就把 data/ 里的小文件推回仓库，
+            # 这样网页上随时能看到 CSV，也不用怕 6 小时中途被取消导致数据全丢
+            last_commit = _maybe_commit(last_commit)
 
         # 进度心跳：每 PROGRESS_EVERY 轮报一次运行时长，方便在 Actions 日志里定位
         if count % PROGRESS_EVERY == 0:

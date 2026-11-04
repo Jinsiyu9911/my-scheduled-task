@@ -809,7 +809,10 @@ def generate_hourly_chart(suffix: str = ""):
         anchor = now.replace(hour=DAILY_SUMMARY_HOUR, minute=DAILY_SUMMARY_MINUTE,
                              second=0, microsecond=0)
     else:
-        anchor = now
+        # 终点对齐到整点：图表本来就是「整点那一分钟」生成的，
+        # 若用当前时刻当终点，会多出一根"只有几秒数据"的柱子（看着像该小时没用电）。
+        # 对齐后正好是最近 24 个完整小时，和横轴整点刻度一致。
+        anchor = now.replace(minute=0, second=0, microsecond=0)
     end_time = anchor
     start_time = end_time - timedelta(hours=24)
 
