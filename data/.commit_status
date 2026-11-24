@@ -1,1 +1,1 @@
-{"time": "2026-11-25 05:00:11", "ok": false, "detail": "推送失败: remote: Internal Server Error        \nremote: Request ID 3849:1E9E93:1EA22:3A84A:6B05FAD8        \nremote: Time 2026-11-24T21:00:09Z\nTo https://github.com/Jinsiyu9911/my-scheduled-task\n ! [remote rejected]     HEAD -> main (Internal Server Error)\nerror: failed to push some refs to 'https://github.com"}
+{"time": "2026-11-25 05:31:03", "ok": true, "detail": "已推送 e54f5b43c"}
